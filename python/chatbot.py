@@ -1,11 +1,22 @@
 import arxiv
 import json
 import os
+import pickle
 from typing import List
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai import types
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from PyPDF2 import PdfReader
+from PIL import Image
+import pytesseract
 
+# If modifying these scopes, delete the file token.pickle.
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 PAPER_DIR = "papers"
 
 # Load environment variables
@@ -186,7 +197,7 @@ def extract_info(paper_id: str) -> str:
     
     return f"There's no saved information related to paper {paper_id}."
 
-# Define the tools schema using the official format
+# Define the tools schema using the correct format for Gemini API
 tools = [
     {
         "function_declarations": [
@@ -221,98 +232,159 @@ tools = [
                     },
                     "required": ["paper_id"]
                 }
+            },
+            {
+                "name": "read_drive_file",
+                "description": "Read a file from Google Drive using its file ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_id": {
+                            "type": "string",
+                            "description": "The ID of the file to read from Google Drive"
+                        }
+                    },
+                    "required": ["file_id"]
+                }
+            },
+            {
+                "name": "read_drive_file_by_name",
+                "description": "Read a file from Google Drive by searching for its name.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_name": {
+                            "type": "string",
+                            "description": "The name of the file to search for and read from Google Drive"
+                        }
+                    },
+                    "required": ["file_name"]
+                }
             }
         ]
     }
 ]
 
-# Initialize the model with tools after tools is defined
+# Create the model
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Update the mapping to use the correct function names
-mapping_tool_function = {
-    "search_papers": search_papers,
-    "extract_info": extract_info,
-    "read_drive_file": read_drive_file,
-    "read_drive_file_by_name": read_drive_file_by_name
-}
-
 def execute_tool(tool_name, tool_args):
-    result = mapping_tool_function[tool_name](**tool_args)
-
-    if result is None:
-        result = "The operation completed but didn't return any results."
-    elif isinstance(result, list):
-        result = ', '.join(result)
-    elif isinstance(result, dict):
-        # Convert dictionaries to formatted JSON strings
-        result = json.dumps(result, indent=2)
+    """Execute a tool with the given name and arguments."""
+    if tool_name == "search_papers":
+        return search_papers(**tool_args)
+    elif tool_name == "extract_info":
+        return extract_info(**tool_args)
+    elif tool_name == "read_drive_file":
+        return read_drive_file(**tool_args)
+    elif tool_name == "read_drive_file_by_name":
+        return read_drive_file_by_name(**tool_args)
     else:
-        # For any other type, convert using str()
-        result = str(result)
-    return result
+        return f"Unknown tool: {tool_name}"
 
 def process_query(query):
-    chat = model.start_chat()
-    
-    # Send the initial message with the tools
-    response = chat.send_message(
-        query,
-        tools=tools
-    )
+    """Process a user query using the Gemini model."""
+    try:
+        # Start a chat
+        chat = model.start_chat(history=[])
+        
+        # Generate a response with tool calls
+        response = chat.send_message(
+            query,
+            tools=tools,
+            generation_config={"temperature": 0.7}
+        )
 
-    process_query = True
-    while process_query:
-        try:
-            if not response.candidates:
-                print("No response received from the model.")
-                process_query = False
+        # Process the response
+        if not response or not response.candidates:
+            return "No response generated. Please try rephrasing your query."
+
+        # Initialize result with empty string
+        result = ""
+        
+        # Process all parts of the response
+        for candidate in response.candidates:
+            if not candidate or not candidate.content or not candidate.content.parts:
                 continue
-
-            # Get the first candidate's content parts
-            parts = response.candidates[0].content.parts
-
-            # Check if there's a function call
-            if hasattr(parts[0], 'function_call'):
-                # Handle function call
-                function_call = parts[0].function_call
-                tool_name = function_call.name
                 
-                # Convert MapComposite to dict for the arguments
-                tool_args = {}
-                for key, value in function_call.args.items():
-                    tool_args[key] = value
+            for part in candidate.content.parts:
+                # Handle text parts
+                if hasattr(part, 'text') and part.text:
+                    result += part.text + "\n"
                 
-                print(f"Calling tool {tool_name} with args {tool_args}")
-                result = execute_tool(tool_name, tool_args)
-                
-                # Send the function result back to the model
-                response = chat.send_message(result)
-            else:
-                # Handle text response - combine all text parts
-                text_response = ""
-                for part in parts:
-                    if hasattr(part, 'text'):
-                        text_response += part.text
-                print(text_response)
-                process_query = False
+                # Handle function calls
+                if hasattr(part, 'function_call'):
+                    tool_call = part.function_call
+                    if not tool_call or not hasattr(tool_call, 'name'):
+                        continue
+                        
+                    tool_name = tool_call.name
+                    
+                    # Convert MapComposite args to dict
+                    if hasattr(tool_call, 'args'):
+                        if isinstance(tool_call.args, dict):
+                            tool_args = tool_call.args
+                        else:
+                            try:
+                                # Convert MapComposite to dict
+                                tool_args = dict(tool_call.args)
+                            except Exception as e:
+                                print(f"Warning: Could not convert tool args: {e}")
+                                tool_args = {}
+                    else:
+                        tool_args = {}
+                    
+                    try:
+                        # Execute the tool and get the result
+                        tool_result = execute_tool(tool_name, tool_args)
+                        
+                        # Send the tool result back to continue the conversation
+                        follow_up = chat.send_message(
+                            f"Tool {tool_name} returned: {str(tool_result)}",
+                            tools=tools
+                        )
+                        
+                        # Process follow-up response parts
+                        if follow_up and follow_up.candidates:
+                            for follow_part in follow_up.candidates[0].content.parts:
+                                if hasattr(follow_part, 'text') and follow_part.text:
+                                    result += follow_part.text + "\n"
+                    except Exception as e:
+                        result += f"\nError executing tool {tool_name}: {str(e)}\n"
 
-        except Exception as e:
-            print(f"Error processing response: {str(e)}")
-            process_query = False
+        return result.strip() if result.strip() else "I couldn't process that request. Please try rephrasing it."
+
+    except Exception as e:
+        return f"Error processing query: {str(e)}"
 
 def chat_loop():
-    print("Type your queries or 'quit' to exit.")
+    """Main chat loop for interacting with the user."""
+    print("Welcome to the Research Assistant! Type 'quit' to exit.")
+    print("You can:")
+    print("1. Search for papers on a topic (e.g., 'Find papers about machine learning')")
+    print("2. Get information about a specific paper (e.g., 'Tell me about paper 2211.05071')")
+    print("3. Read files from Google Drive (e.g., 'Read the file named example.pdf')")
+    print("\nWhat would you like to do?")
+    
     while True:
         try:
-            query = input("\nQuery: ").strip()
-            if query.lower() == 'quit':
+            # Get user input
+            user_input = input("\nYou: ").strip()
+            
+            # Check for exit command
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                print("Goodbye!")
                 break
-    
-            process_query(query)
-            print("\n")
+                
+            # Process the query and get response
+            if user_input:
+                response = process_query(user_input)
+                print("\nAssistant:", response)
+            
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break
         except Exception as e:
             print(f"\nError: {str(e)}")
 
-
-chat_loop()
+if __name__ == "__main__":
+    chat_loop()

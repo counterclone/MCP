@@ -11,12 +11,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 from PyPDF2 import PdfReader
 from PIL import Image
 import pytesseract
 
 # If modifying these scopes, delete the file token.pickle.
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.metadata.readonly'
+]
 PAPER_DIR = "papers"
 
 # Load environment variables
@@ -24,21 +28,54 @@ load_dotenv()
 # Initialize the Gemini client with the API key from environment variables
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 
+def handle_google_api_error(error):
+    """Handle Google API errors with specific messages."""
+    if isinstance(error, HttpError):
+        if error.resp.status == 403:
+            if "access_denied" in str(error):
+                return ("Access denied. This application is in testing mode. "
+                       "Please ensure your Google account (devansh2102003@gmail.com) "
+                       "is added as a test user in the Google Cloud Console.")
+            return f"Permission denied: {str(error)}"
+        return f"Google API error: {str(error)}"
+    return str(error)
+
 def get_drive_service():
+    """Get or create Google Drive service with proper error handling."""
     creds = None
     if os.path.exists('token.pickle'):
         with open('token.pickle', 'rb') as token:
             creds = pickle.load(token)
+    
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=8080)
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-    service = build('drive', 'v3', credentials=creds)
-    return service
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                # If refresh fails, force new authentication
+                creds = None
+                if os.path.exists('token.pickle'):
+                    os.remove('token.pickle')
+                print(f"Token refresh failed: {str(e)}. Please authenticate again.")
+        
+        if not creds:
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                creds = flow.run_local_server(port=8080)
+                # Save the credentials for the next run
+                with open('token.pickle', 'wb') as token:
+                    pickle.dump(creds, token)
+            except Exception as e:
+                raise Exception(f"Authentication failed: {str(e)}")
+    
+    try:
+        service = build('drive', 'v3', credentials=creds)
+        # Test the credentials with a simple API call
+        service.files().list(pageSize=1).execute()
+        return service
+    except HttpError as e:
+        error_message = handle_google_api_error(e)
+        raise Exception(error_message)
 
 def get_file_id_by_name(file_name: str) -> list:
     """
@@ -72,38 +109,72 @@ def read_drive_file(file_id: str) -> str:
     """
     Downloads any file from Google Drive by file ID and saves it locally.
     Returns the content for text files, extracts text from PDFs/images, or the local file path for other types.
+    Handles Google Docs files by exporting them to PDF format.
     """
-    service = get_drive_service()
-    file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
-    file_name = file.get("name")
-    mime_type = file.get("mimeType")
-    request = service.files().get_media(fileId=file_id)
-    local_path = os.path.join("downloads", file_name)
-    os.makedirs("downloads", exist_ok=True)
-    with open(local_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-    # Return content for text files, extract text for PDFs/images, otherwise return the file path
-    if mime_type and mime_type.startswith("text/"):
-        with open(local_path, "r", encoding="utf-8") as f:
-            return f.read()
-    elif mime_type == "application/pdf" or (file_name and file_name.lower().endswith(".pdf")):
-        return extract_text_from_pdf(local_path)
-    elif mime_type and mime_type.startswith("image/"):
-        return extract_text_from_image(local_path)
-    else:
-        return f"File '{file_name}' (type: {mime_type}) downloaded to: {local_path}"
+    try:
+        service = get_drive_service()
+        
+        # Get file metadata first
+        file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
+        file_name = file.get("name")
+        mime_type = file.get("mimeType")
+        
+        # Handle Google Docs files
+        google_docs_mimes = {
+            'application/vnd.google-apps.document': 'application/pdf',
+            'application/vnd.google-apps.spreadsheet': 'application/pdf',
+            'application/vnd.google-apps.presentation': 'application/pdf'
+        }
+        
+        local_path = os.path.join("downloads", file_name)
+        if mime_type in google_docs_mimes:
+            # Export Google Docs files
+            request = service.files().export_media(fileId=file_id, mimeType=google_docs_mimes[mime_type])
+            if not file_name.lower().endswith('.pdf'):
+                local_path += '.pdf'
+        else:
+            # Download regular files
+            request = service.files().get_media(fileId=file_id)
+            
+        os.makedirs("downloads", exist_ok=True)
+        with open(local_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                
+        # Return content based on file type
+        if mime_type in google_docs_mimes or mime_type == "application/pdf" or local_path.lower().endswith('.pdf'):
+            return extract_text_from_pdf(local_path)
+        elif mime_type and mime_type.startswith("text/"):
+            with open(local_path, "r", encoding="utf-8") as f:
+                return f.read()
+        elif mime_type and mime_type.startswith("image/"):
+            return extract_text_from_image(local_path)
+        else:
+            return f"File '{file_name}' (type: {mime_type}) downloaded to: {local_path}"
+            
+    except HttpError as e:
+        return handle_google_api_error(e)
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
 
 def read_drive_file_by_name(file_name: str) -> str:
-    files = get_file_id_by_name(file_name)
-    if not files:
-        return f"No file found with name '{file_name}'."
-    if len(files) == 1:
-        return read_drive_file(files[0]['id'])
-    # If multiple files, list them for user to choose
-    return f"Multiple files found with name '{file_name}':\n" + json.dumps(files, indent=2)
+    """
+    Read a file from Google Drive by searching for its name.
+    """
+    try:
+        files = get_file_id_by_name(file_name)
+        if not files:
+            return f"No file found with name '{file_name}'."
+        if len(files) == 1:
+            return read_drive_file(files[0]['id'])
+        # If multiple files, list them for user to choose
+        return f"Multiple files found with name '{file_name}':\n" + json.dumps(files, indent=2)
+    except HttpError as e:
+        return handle_google_api_error(e)
+    except Exception as e:
+        return f"Error searching for file: {str(e)}"
 
 def search_papers(topic: str, max_results: int = 5) -> List[str]:
     """
